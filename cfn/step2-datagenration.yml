@@ -1,0 +1,343 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Builds the kinesis-analytics-taxi-consumer Flink application and provisions the basic infrastructure for the streaming workshop (streaming-workshop-infrastructure)
+
+Parameters:
+  KinesisDataStreamName:
+    Description: Name of an existing Kinesis Data Stream to enable reading and writing to the stream
+    ConstraintDescription: Must be the name of an existing Kinesis Data Stream
+    Type: String
+
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  SecurityGroup:
+    Type: String
+  PublicSubnet1:
+    Type: String
+
+Outputs:
+  AmazonS3Bucket: 
+    Value: !Ref ArtifactBucket
+        
+  PathToAmazonS3Object: 
+    Value: !GetAtt TaxiConsumerBuildStack.Outputs.FlinkApplicationS3Path
+
+  ElasticsearchEndpoint:
+    Value: !GetAtt ElasticsearchService.DomainEndpoint
+
+  KinesisReplayInstance:
+    Description: The URL to the Session Management Console for this instance 
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/systems-manager/session-manager/${KinesisReplayInstance}?region=${AWS::Region}  
+
+  ProducerCommand:
+    Description: Command to populate Kinesis stream with taxi trip events 
+    Value: !Sub java -jar ~/amazon-kinesis-replay-0.1.0.jar -streamRegion ${AWS::Region} -streamName ${KinesisDataStreamName} -speedup 1800
+
+  KibanaDashboard:
+    Value: !Sub https://${ElasticsearchService.DomainEndpoint}/_plugin/kibana/app/kibana#/dashboard/nyc-tlc-dashboard
+
+  KinesisDataStreamName: 
+    Description: Kinesis Data Stream Name
+    Value: !Ref KinesisDataStreamName    
+
+Resources:
+  
+  KinesisReplayBuildStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: https://s3.amazonaws.com/aws-bigdata-blog/artifacts/kinesis-analytics-taxi-consumer/cfn-templates/kinesis-replay-build-pipeline.yml
+      Parameters:
+        ExternalArtifactBucket: !Ref ArtifactBucket
+
+  FlinkKinesisConnectorBuildStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: https://aws-data-analytics-workshops.s3.amazonaws.com/kinesis/templates/flink-kinesis-connector-build-pipeline.yml
+      Parameters:
+        ArtifactBucket: !Ref ArtifactBucket
+
+  TaxiConsumerBuildStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: https://aws-data-analytics-workshops.s3.amazonaws.com/kinesis/templates/kinesis-analytics-taxi-consumer-build-pipeline.yml
+      Parameters:
+        ArtifactBucket: !Ref ArtifactBucket
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+
+
+  KinesisReplayInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      Monitoring: true
+      InstanceType: c5.xlarge
+      IamInstanceProfile: !Ref KinesisReplayInstanceProfile
+      NetworkInterfaces:
+      - AssociatePublicIpAddress: true
+        DeleteOnTermination: true
+        DeviceIndex: 0
+        SubnetId: !Ref 'PublicSubnet1'
+        GroupSet: 
+            - Ref: 'SecurityGroup'
+      Tags:
+      - Key: Application
+        Value: !Ref AWS::StackId
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-producer-instance
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash -x
+            
+            yum update -y
+            yum install -y tmux
+
+            # install Java 11
+            amazon-linux-extras enable java-openjdk11
+            yum install -y java-11-openjdk
+
+            # wait until CF stack, in particular the EIP association, was created successfully
+            aws --region ${AWS::Region} cloudformation wait stack-create-complete --stack-name '${AWS::StackName}'
+
+            # create ES indices
+            curl -s https://raw.githubusercontent.com/aws-samples/amazon-kinesis-analytics-taxi-consumer/master/misc/trip-duration-index.json | curl -s -w "\n" -XPUT https://${ElasticsearchService.DomainEndpoint}/trip_duration -H "Content-Type: application/json" -d @-
+            curl -s https://raw.githubusercontent.com/aws-samples/amazon-kinesis-analytics-taxi-consumer/master/misc/pickup-count-index.json | curl -s -w "\n" -XPUT https://${ElasticsearchService.DomainEndpoint}/pickup_count -H "Content-Type: application/json" -d @-
+
+            # create Kinaba visualizations and dashboard
+            curl -s https://raw.githubusercontent.com/aws-samples/amazon-kinesis-analytics-taxi-consumer/master/misc/nyc-tlc-dashboard.json | curl -s -w "\n" -XPOST https://${ElasticsearchService.DomainEndpoint}/_plugin/kibana/api/saved_objects/_bulk_create -H 'Content-Type: application/json' -H 'kbn-xsrf: true' -d @-
+
+            # set default Kibana index pattern
+            curl -s -w "\n" -XPOST 'https://${ElasticsearchService.DomainEndpoint}/_plugin/kibana/api/kibana/settings' -H 'content-type: application/json' -H 'kbn-xsrf: true' --data '{"changes":{"defaultIndex":"trip-duration-index-pattern"}}'
+
+            # copy the replay Java app from s3
+            su ssm-user -l -c "${KinesisReplayBuildStack.Outputs.KinesisReplayCopyCommand}"
+            su ec2-user -l -c "aws s3 cp 's3://${ArtifactBucket}/' /home/ssm-user/ --recursive --exclude '*' --include 'amazon-kinesis-replay-*.jar' "
+            #su ec2-user -l -c "aws s3 cp 's3://${ArtifactBucket}/' /home/ec2-user/ --recursive --exclude '*' --include 'amazon-kinesis-replay-*.jar' "
+            aws s3 cp 's3://${ArtifactBucket}/' /tmp/ --recursive --exclude '*' --include 'amazon-kinesis-replay-*.jar' 
+            aws s3 cp 's3://${ArtifactBucket}/' /home/ssm-user/ --recursive --exclude '*' --include 'amazon-kinesis-replay-*.jar' 
+  
+  Ec2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ ec2.amazonaws.com ]
+            Action:
+              - sts:AssumeRole
+      Path: /
+
+  KinesisReplayInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - Ref: KinesisReplayRole
+
+  KinesisReplayInstanceIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  KinesisReplayInstanceIpAssiciation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref KinesisReplayInstance
+      AllocationId: !GetAtt KinesisReplayInstanceIp.AllocationId
+
+
+  ElasticsearchService:
+    Type: AWS::Elasticsearch::Domain
+    Properties:
+      AccessPolicies:
+        !Sub |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "AWS": "*"
+                },
+                "Action": [
+                  "es:ESHttpGet",
+                  "es:ESHttpPut",
+                  "es:ESHttpPost",
+                  "es:ESHttpHead",
+                  "es:ESHttpDelete"
+                ],
+                "Resource": "*",
+                "Condition": {
+                  "IpAddress": {
+                    "aws:SourceIp": [
+                      "123.123.123.123/32",
+                      "${KinesisReplayInstanceIp}"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+      ElasticsearchClusterConfig:
+        InstanceCount: 1
+        InstanceType: r5.large.elasticsearch
+      EBSOptions:
+        EBSEnabled: true
+        VolumeSize: 10
+        VolumeType: gp2
+      ElasticsearchVersion: 6.7
+
+
+  KinesisReplayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+      Policies:
+        -
+          PolicyName: root
+          PolicyDocument:
+            !Sub |
+              {
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                      "Effect": "Allow",
+                      "Action": [
+                          "kinesisanalytics:CreateApplication",
+                          "kinesisanalytics:StartApplication"
+                      ],
+                      "Resource": "*"
+                  },
+                  {
+                      "Effect": "Allow",
+                      "Action": [
+                          "kinesis:DescribeStream",
+                          "kinesis:ListShards",
+                          "kinesis:GetShardIterator",
+                          "kinesis:GetRecords",
+                          "kinesis:PutRecord",
+                          "kinesis:PutRecords"
+                      ],
+                      "Resource": "*"
+                  },
+                  {
+                      "Effect": "Allow",
+                      "Action": [
+                          "cloudwatch:PutMetricData"
+                      ],
+                      "Resource": "*"
+                  },
+                  {
+                      "Effect": "Allow",
+                      "Action": "cloudformation:DescribeStacks",
+                      "Resource": "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*"
+                  },
+                  {
+                      "Effect": "Allow",
+                      "Action": [
+                          "s3:GetObject",
+                          "s3:ListBucket"
+                      ],
+                      "Resource": "*"
+                  }
+                ]
+              }
+
+  KinesisAnalyticsServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": [ "kinesisanalytics.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      Policies:
+        -
+          PolicyName: root
+          PolicyDocument:
+            !Sub |
+              {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                      {
+                          "Effect": "Allow",
+                          "Action": [
+                              "s3:GetObject",
+                              "s3:GetObjectVersion"
+                          ],
+                          "Resource": [
+                              "arn:aws:s3:::${ArtifactBucket}/*"
+                          ]
+                      },
+                      {
+                          "Effect": "Allow",
+                          "Action": [
+                              "logs:DescribeLogGroups"
+                          ],
+                          "Resource": [
+                              "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+                          ]
+                      },
+                      {
+                          "Effect": "Allow",
+                          "Action": [
+                              "logs:DescribeLogStreams",
+                              "logs:PutLogEvents"
+                          ],
+                          "Resource": [
+                              "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesis-analytics/streaming-workshop-java-app:*"
+                          ]
+                      },
+                      {
+                          "Effect": "Allow",
+                          "Action": "kinesis:*",
+                          "Resource": "arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${KinesisDataStreamName}"
+                      },
+                      {
+                          "Effect": "Allow",
+                          "Action": [
+                            "es:ESHttpPut",
+                            "es:ESHttpPost",
+                            "es:ESHttpHead"
+                          ],
+                          "Resource": "${ElasticsearchService.Arn}/*"
+                      }
+                  ]
+              }
+
+
+Mappings:
+  AWSRegionArch2AMI:
+    eu-west-1:
+      HVM64: ami-07683a44e80cd32c5
+    us-west-2:
+      HVM64: ami-061392db613a6357b
+    us-east-1:
+      HVM64: ami-0de53d8956e8dcf80
+    us-east-2:
+      HVM64: ami-02bcbb802e03574ba
+    ap-northeeast-1:
+      HVM64: ami-02bcbb802e03574ba
